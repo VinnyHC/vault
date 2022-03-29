@@ -129,6 +129,7 @@ type ServerCommand struct {
 	flagDevFourCluster     bool
 	flagDevTransactional   bool
 	flagDevAutoSeal        bool
+	flagDevQuickStart      bool
 	flagTestVerifyOnly     bool
 	flagCombineLogs        bool
 	flagTestServerConfig   bool
@@ -274,6 +275,15 @@ func (c *ServerCommand) Flags() *FlagSets {
 	// no warranty or backwards-compatibility promise. Do not use these flags
 	// in production. Do not build automation using these flags. Unless you are
 	// developing against Vault, you should not need any of these flags.
+
+	f.BoolVar(&BoolVar{
+		Name:    "dev-quickstart",
+		Target:  &c.flagDevQuickStart,
+		Default: false,
+		Hidden:  true,
+		Usage: "Configure the development server to include app role authentication enabled " +
+			"using the role name \"vault-dev\"",
+	})
 
 	f.StringVar(&StringVar{
 		Name:       "dev-plugin-dir",
@@ -1645,8 +1655,17 @@ func (c *ServerCommand) notifySystemd(status string) {
 	}
 }
 
-func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig) (*vault.InitResult, error) {
+type devOptions struct {
+	appRoleRoleID   string
+	appRoleSecretID string
+	policy          string
+	policyName      string
+	appRoleRoleName string
+}
+
+func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig) (*vault.InitResult, *devOptions, error) {
 	ctx := namespace.ContextWithNamespace(context.Background(), namespace.RootNamespace)
+	var options *devOptions
 
 	var recoveryConfig *vault.SealConfig
 	barrierConfig := &vault.SealConfig{
@@ -1671,14 +1690,14 @@ func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig
 		RecoveryConfig: recoveryConfig,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Handle unseal with stored keys
 	if core.SealAccess().StoredKeysSupported() == vaultseal.StoredKeysSupportedGeneric {
 		err := core.UnsealWithStoredKeys(ctx)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else {
 		// Copy the key so that it can be zeroed
@@ -1688,16 +1707,16 @@ func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig
 		// Unseal the core
 		unsealed, err := core.Unseal(key)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if !unsealed {
-			return nil, fmt.Errorf("failed to unseal Vault for dev mode")
+			return nil, nil, fmt.Errorf("failed to unseal Vault for dev mode")
 		}
 	}
 
 	isLeader, _, _, err := core.Leader()
 	if err != nil && err != vault.ErrHANotEnabled {
-		return nil, fmt.Errorf("failed to check active status: %w", err)
+		return nil, nil, fmt.Errorf("failed to check active status: %w", err)
 	}
 	if err == nil {
 		leaderCount := 5
@@ -1705,12 +1724,12 @@ func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig
 			if leaderCount == 0 {
 				buf := make([]byte, 1<<16)
 				runtime.Stack(buf, true)
-				return nil, fmt.Errorf("failed to get active status after five seconds; call stack is\n%s", buf)
+				return nil, nil, fmt.Errorf("failed to get active status after five seconds; call stack is\n%s", buf)
 			}
 			time.Sleep(1 * time.Second)
 			isLeader, _, _, err = core.Leader()
 			if err != nil {
-				return nil, fmt.Errorf("failed to check active status: %w", err)
+				return nil, nil, fmt.Errorf("failed to check active status: %w", err)
 			}
 			leaderCount--
 		}
@@ -1732,13 +1751,13 @@ func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig
 		}
 		resp, err := core.HandleRequest(ctx, req)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create root token with ID %q: %w", coreConfig.DevToken, err)
+			return nil, nil, fmt.Errorf("failed to create root token with ID %q: %w", coreConfig.DevToken, err)
 		}
 		if resp == nil {
-			return nil, fmt.Errorf("nil response when creating root token with ID %q", coreConfig.DevToken)
+			return nil, nil, fmt.Errorf("nil response when creating root token with ID %q", coreConfig.DevToken)
 		}
 		if resp.Auth == nil {
-			return nil, fmt.Errorf("nil auth when creating root token with ID %q", coreConfig.DevToken)
+			return nil, nil, fmt.Errorf("nil auth when creating root token with ID %q", coreConfig.DevToken)
 		}
 
 		init.RootToken = resp.Auth.ClientToken
@@ -1748,7 +1767,7 @@ func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig
 		req.Data = nil
 		_, err = core.HandleRequest(ctx, req)
 		if err != nil {
-			return nil, fmt.Errorf("failed to revoke initial root token: %w", err)
+			return nil, nil, fmt.Errorf("failed to revoke initial root token: %w", err)
 		}
 	}
 
@@ -1756,10 +1775,10 @@ func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig
 	if !c.flagDevNoStoreToken {
 		tokenHelper, err := c.TokenHelper()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := tokenHelper.Store(init.RootToken); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -1782,13 +1801,148 @@ func (c *ServerCommand) enableDev(core *vault.Core, coreConfig *vault.CoreConfig
 	}
 	resp, err := core.HandleRequest(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("error creating default K/V store: %w", err)
+		return nil, nil, fmt.Errorf("error creating default K/V store: %w", err)
 	}
 	if resp.IsError() {
-		return nil, fmt.Errorf("failed to create default K/V store: %w", resp.Error())
+		return nil, nil, fmt.Errorf("failed to create default K/V store: %w", resp.Error())
 	}
 
-	return init, nil
+	if c.flagDevQuickStart {
+
+		if options == nil {
+			options = &devOptions{
+				appRoleRoleName: "dev-role",
+				policyName:      "dev-role",
+				policy:          "path \"secret/*\" {capabilities = [\"create\", \"read\", \"update\", \"delete\"]}",
+			}
+		}
+
+		r := &logical.Request{
+			Operation:   logical.UpdateOperation,
+			ClientToken: init.RootToken,
+			Path:        fmt.Sprintf("sys/policy/%s", options.policyName),
+			Data: map[string]interface{}{
+				"name":   options.policyName,
+				"policy": options.policy,
+			},
+		}
+		qsResp, qsErr := core.HandleRequest(ctx, r)
+		if qsErr != nil {
+			return nil, nil, fmt.Errorf("error creating dev policy: %w", qsErr)
+		}
+		if qsResp.IsError() {
+			return nil, nil, fmt.Errorf("failed to create policy: %w", qsResp.Error())
+		}
+
+		r = &logical.Request{
+			Operation:   logical.UpdateOperation,
+			ClientToken: init.RootToken,
+			Path:        "sys/auth/approle",
+			Data: map[string]interface{}{
+				"type":        "approle",
+				"path":        "approle/",
+				"description": "sample approle method",
+			},
+		}
+		qsResp, qsErr = core.HandleRequest(ctx, r)
+		if qsErr != nil {
+			return nil, nil, fmt.Errorf("error creating approle: %w", qsErr)
+		}
+		if qsResp.IsError() {
+			return nil, nil, fmt.Errorf("failed to create approle: %w", qsResp.Error())
+		}
+
+		r = &logical.Request{
+			Operation:   logical.UpdateOperation,
+			ClientToken: init.RootToken,
+			Path:        fmt.Sprintf("auth/approle/role/%s", options.appRoleRoleName),
+			Data: map[string]interface{}{
+				"role_name":      options.appRoleRoleName,
+				"secret_id_ttl":  "764h",
+				"token_policies": []string{options.policyName, "default"},
+			},
+		}
+		qsResp, qsErr = core.HandleRequest(ctx, r)
+		if qsErr != nil {
+			return nil, nil, fmt.Errorf("error creating approle role: %w", qsErr)
+		}
+		if qsResp.IsError() {
+			return nil, nil, fmt.Errorf("failed to create approle role: %w", qsResp.Error())
+		}
+
+		r = &logical.Request{
+			Operation:   logical.ReadOperation,
+			ClientToken: init.RootToken,
+			Path:        fmt.Sprintf("auth/approle/role/%s/role-id", options.appRoleRoleName),
+		}
+		qsResp, qsErr = core.HandleRequest(ctx, r)
+		if qsErr != nil {
+			return nil, nil, fmt.Errorf("error retrieving approle id: %w", qsErr)
+		}
+		if qsResp.IsError() {
+			return nil, nil, fmt.Errorf("failed to retrieve approle id: %w", qsResp.Error())
+		}
+
+		if roleID, ok := qsResp.Data["role_id"]; ok {
+			options.appRoleRoleID = roleID.(string)
+		}
+
+		r = &logical.Request{
+			Operation:   logical.UpdateOperation,
+			ClientToken: init.RootToken,
+			Path:        fmt.Sprintf("auth/approle/role/%s/secret-id", options.appRoleRoleName),
+		}
+		qsResp, qsErr = core.HandleRequest(ctx, r)
+		if qsErr != nil {
+			return nil, nil, fmt.Errorf("error retrieving approle id: %w", qsErr)
+		}
+		if qsResp.IsError() {
+			return nil, nil, fmt.Errorf("failed to retrieve approle id: %w", qsResp.Error())
+		}
+
+		if secretID, ok := qsResp.Data["secret_id"]; ok {
+			options.appRoleSecretID = secretID.(string)
+		}
+
+		r = &logical.Request{
+			Operation:   logical.UpdateOperation,
+			ClientToken: init.RootToken,
+			Path:        "secret/data/sample-secret",
+			Data: map[string]interface{}{
+				"data": map[string]interface{}{
+					"foo": "bar",
+					"zip": "zap",
+				},
+			},
+		}
+		qsResp, qsErr = core.HandleRequest(ctx, r)
+		if qsErr != nil {
+			return nil, nil, fmt.Errorf("error writing sample secret: %w", qsErr)
+		}
+		if qsResp.IsError() {
+			return nil, nil, fmt.Errorf("failed to write sample secret: %w", qsResp.Error())
+		}
+
+		r = &logical.Request{
+			Operation:   logical.UpdateOperation,
+			ClientToken: init.RootToken,
+			Path:        "secret/metadata/sample-secret",
+			Data: map[string]interface{}{
+				"custom_metadata": map[string]interface{}{
+					"isSample": true,
+				},
+			},
+		}
+		qsResp, qsErr = core.HandleRequest(ctx, r)
+		if qsErr != nil {
+			return nil, nil, fmt.Errorf("error writing sample secret metadata: %w", qsErr)
+		}
+		if qsResp.IsError() {
+			return nil, nil, fmt.Errorf("failed to write sample secret metadata: %w", qsResp.Error())
+		}
+	}
+
+	return init, options, nil
 }
 
 func (c *ServerCommand) enableThreeNodeDevCluster(base *vault.CoreConfig, info map[string]string, infoKeys []string, devListenAddress, tempDir string) int {
@@ -2550,7 +2704,7 @@ func runListeners(c *ServerCommand, coreConfig *vault.CoreConfig, config *server
 func initDevCore(c *ServerCommand, coreConfig *vault.CoreConfig, config *server.Config, core *vault.Core) error {
 	if c.flagDev && !c.flagDevSkipInit {
 
-		init, err := c.enableDev(core, coreConfig)
+		init, options, err := c.enableDev(core, coreConfig)
 		if err != nil {
 			return fmt.Errorf("Error initializing Dev mode: %s", err)
 		}
@@ -2648,6 +2802,29 @@ func initDevCore(c *ServerCommand, coreConfig *vault.CoreConfig, config *server.
 						for _, p := range pluginsNotLoaded {
 							c.UI.Warn(fmt.Sprintf("    - %s", p))
 						}
+					}
+
+					if c.flagDevQuickStart {
+						if options == nil {
+							options = &devOptions{}
+						}
+						c.UI.Warn("")
+						c.UI.Warn(wrapAtLength("Applications can login with the following AppRole credentials:"))
+						c.UI.Warn("")
+						c.UI.Warn(fmt.Sprintf("Login Path: %s/v1/auth/approle/login", endpointURL))
+						c.UI.Warn(fmt.Sprintf(" Role Name: %s", options.appRoleRoleName))
+						c.UI.Warn(fmt.Sprintf("   Role ID: %s", options.appRoleRoleID))
+						c.UI.Warn(fmt.Sprintf(" Secret ID: %s", options.appRoleSecretID))
+						c.UI.Warn("")
+						c.UI.Warn(wrapAtLength("AppRole logins will have the following policy:"))
+						c.UI.Warn("")
+						c.UI.Warn(fmt.Sprintf("Policy Path: %s/v1/sys/policy/%s", endpointURL, options.policyName))
+						c.UI.Warn(fmt.Sprintf("     Policy: %s", options.policy))
+						c.UI.Warn("")
+						c.UI.Warn(wrapAtLength("A sample secret is available at:"))
+						c.UI.Warn("")
+						c.UI.Warn(fmt.Sprintf("  Secret Path: %s/v1/secret/data/sample-secret", endpointURL))
+						c.UI.Warn(fmt.Sprintf("Metadata Path: %s/v1/secret/metadata/sample-secret", endpointURL))
 					}
 
 					c.UI.Warn("")
