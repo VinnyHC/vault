@@ -54,3 +54,13 @@ If you're new to Vault, you may want to pick up with [Your First Secret](/intro/
 
 In addition to experimentation, the dev server is very easy to automate
 for development environments.
+
+## Quickstart Option
+
+If you initiate a "dev" server with the flag `-dev-quickstart`
+(e.g. `vault server -dev -dev-quickstart`) a suite of options are enabled to explore
+a configured Vault server. The options include an Identity Entity with an associated
+Userpass account for exploring the identity system. It will also enable an App Role
+authentication mechanism for exploring a common method to authenticate applications.
+The option also seeds the system with the required policies and a sample secret. More
+information can be found in the banner found on the CLI when the flag is toggled.
