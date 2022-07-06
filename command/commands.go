@@ -20,6 +20,7 @@ import (
 	_ "github.com/hashicorp/vault/helper/builtinplugins"
 
 	auditFile "github.com/hashicorp/vault/builtin/audit/file"
+	auditCloud "github.com/hashicorp/vault/builtin/audit/redis"
 	auditSocket "github.com/hashicorp/vault/builtin/audit/socket"
 	auditSyslog "github.com/hashicorp/vault/builtin/audit/syslog"
 
@@ -131,6 +132,7 @@ var (
 		"file":   auditFile.Factory,
 		"socket": auditSocket.Factory,
 		"syslog": auditSyslog.Factory,
+		"cloud":  auditCloud.Factory,
 	}
 
 	credentialBackends = map[string]logical.Factory{
