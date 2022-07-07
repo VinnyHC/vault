@@ -93,6 +93,7 @@ func (c *AuditEnableCommand) AutocompleteArgs() complete.Predictor {
 		"file",
 		"syslog",
 		"socket",
+		"redis",
 	)
 }
 

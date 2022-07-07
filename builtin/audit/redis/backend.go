@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/alicebob/miniredis/v2"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,21 +25,6 @@ func Factory(ctx context.Context, conf *audit.BackendConfig) (audit.Backend, err
 		return nil, fmt.Errorf("nil salt view")
 	}
 
-	rawAddr, ok := conf.Config["redis_addrs"]
-	if !ok {
-		return nil, fmt.Errorf("redis_addrs is required")
-	}
-	addrs := strings.Split(rawAddr, ",")
-
-	db, ok := conf.Config["redis_db"]
-	if !ok {
-		db = "0"
-	}
-	dbI, err := strconv.Atoi(db)
-	if err != nil {
-		return nil, fmt.Errorf("redis_db must be an int: %w", err)
-	}
-
 	user, ok := conf.Config["redis_username"]
 	if !ok {
 		user = ""
@@ -47,6 +33,45 @@ func Factory(ctx context.Context, conf *audit.BackendConfig) (audit.Backend, err
 	pw, ok := conf.Config["redis_password"]
 	if !ok {
 		pw = ""
+	}
+
+	// Check if we should embed
+	devRedis := false
+	if raw, ok := conf.Config["dev_redis"]; ok {
+		b, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, err
+		}
+		devRedis = b
+	}
+
+	var addrs []string
+
+	switch {
+	case devRedis:
+		if devRedis {
+			s, err := miniredis.Run()
+			if err != nil {
+				return nil, err
+			}
+			addrs = []string{s.Addr()}
+			s.RequireUserAuth(user, pw)
+		}
+	default:
+		rawAddr, ok := conf.Config["redis_addrs"]
+		if !ok {
+			return nil, fmt.Errorf("redis_addrs is required")
+		}
+		addrs = strings.Split(rawAddr, ",")
+	}
+
+	db, ok := conf.Config["redis_db"]
+	if !ok {
+		db = "0"
+	}
+	dbI, err := strconv.Atoi(db)
+	if err != nil {
+		return nil, fmt.Errorf("redis_db must be an int: %w", err)
 	}
 
 	channel, ok := conf.Config["redis_channel"]
@@ -116,6 +141,7 @@ func Factory(ctx context.Context, conf *audit.BackendConfig) (audit.Backend, err
 type Backend struct {
 	redisClient  redis.UniversalClient
 	redisChannel string
+	embedded     *miniredis.Miniredis
 
 	formatter    audit.AuditFormatter
 	formatConfig audit.FormatterConfig
@@ -162,15 +188,22 @@ func (b *Backend) GetHash(ctx context.Context, data string) (string, error) {
 }
 
 func (b *Backend) LogRequest(ctx context.Context, in *logical.LogInput) error {
-	return b.log(ctx, in)
+	return b.log(ctx, in, "req")
 }
 
 func (b *Backend) LogResponse(ctx context.Context, in *logical.LogInput) error {
-	return b.log(ctx, in)
+	return b.log(ctx, in, "resp")
 }
 
-func (b *Backend) LogTestMessage(ctx context.Context, in *logical.LogInput, _ map[string]string) error {
-	return b.log(ctx, in)
+func (b *Backend) LogTestMessage(ctx context.Context, in *logical.LogInput, config map[string]string) error {
+
+	var buf bytes.Buffer
+	temporaryFormatter := audit.NewTemporaryFormatter(config["format"], config["prefix"])
+	if err := temporaryFormatter.FormatRequest(ctx, &buf, b.formatConfig, in); err != nil {
+		return err
+	}
+
+	return b.redisClient.Publish(ctx, b.redisChannel, buf.String()).Err()
 }
 
 func (b *Backend) Reload(_ context.Context) error {
@@ -183,11 +216,22 @@ func (b *Backend) Invalidate(_ context.Context) {
 	b.salt.Store((*salt.Salt)(nil))
 }
 
-func (b *Backend) log(ctx context.Context, in *logical.LogInput) error {
+func (b *Backend) log(ctx context.Context, in *logical.LogInput, op string) error {
 	buf := bytes.NewBuffer(make([]byte, 0, 2000))
-	err := b.formatter.FormatRequest(ctx, buf, b.formatConfig, in)
-	if err != nil {
-		return err
+
+	switch op {
+	case "req":
+		err := b.formatter.FormatRequest(ctx, buf, b.formatConfig, in)
+		if err != nil {
+			return err
+		}
+	case "resp":
+		err := b.formatter.FormatResponse(ctx, buf, b.formatConfig, in)
+		if err != nil {
+			return err
+		}
+	default:
+		return nil
 	}
 
 	return b.redisClient.Publish(ctx, b.redisChannel, buf.String()).Err()
